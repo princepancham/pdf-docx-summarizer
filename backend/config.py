@@ -1,7 +1,7 @@
 """Application configuration loaded from environment variables.
 
-Phase 1 scope only: no OpenRouter validation or API calls.
-OPENROUTER_API_KEY is intentionally optional here.
+OPENROUTER_API_KEY stays optional so tests and local runs without
+AI credentials still work; the summarize endpoint returns 503 then.
 """
 
 import os
@@ -43,10 +43,17 @@ class Settings:
     upload_dir: Path
     max_file_size_mb: int
     openrouter_api_key: str | None
+    openrouter_model: str
+    openrouter_base_url: str
+    openrouter_timeout_s: int
+    openrouter_max_tokens: int
+    chunk_chars: int
+    chunk_overlap: int
+    max_chunks: int
 
 
 def get_settings() -> Settings:
-    """Build settings from environment with safe Phase 1 defaults."""
+    """Build settings from environment with safe defaults."""
     upload_dir_raw = _get_str("UPLOAD_DIR", "uploads")
     upload_dir = Path(upload_dir_raw)
     if not upload_dir.is_absolute():
@@ -64,6 +71,15 @@ def get_settings() -> Settings:
         upload_dir=upload_dir,
         max_file_size_mb=_get_int("MAX_FILE_SIZE_MB", 20),
         openrouter_api_key=raw_key or None,
+        openrouter_model=_get_str("OPENROUTER_MODEL", "openrouter/free"),
+        openrouter_base_url=_get_str(
+            "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
+        ),
+        openrouter_timeout_s=_get_int("OPENROUTER_TIMEOUT_S", 45),
+        openrouter_max_tokens=_get_int("OPENROUTER_MAX_TOKENS", 500),
+        chunk_chars=_get_int("CHUNK_CHARS", 4000),
+        chunk_overlap=_get_int("CHUNK_OVERLAP", 200),
+        max_chunks=_get_int("MAX_CHUNKS", 12),
     )
 
 

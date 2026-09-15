@@ -1,6 +1,6 @@
-# Phase 2 direct dependencies (backend + frontend + tests).
+# Phase 2 + Document Processing/AI dependencies (backend + frontend + tests).
 # requests is frontend-only (Streamlit -> FastAPI).
-# pytest/httpx are test-only (TestClient-based upload tests).
+# pytest/httpx are test-only (TestClient-based tests).
 fastapi
 uvicorn
 streamlit
@@ -9,3 +9,5 @@ python-multipart
 requests
 pytest
 httpx
+pypdf
+python-docx
