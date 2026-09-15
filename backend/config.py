@@ -50,6 +50,7 @@ class Settings:
     chunk_chars: int
     chunk_overlap: int
     max_chunks: int
+    database_url: str
 
 
 def get_settings() -> Settings:
@@ -80,6 +81,7 @@ def get_settings() -> Settings:
         chunk_chars=_get_int("CHUNK_CHARS", 4000),
         chunk_overlap=_get_int("CHUNK_OVERLAP", 200),
         max_chunks=_get_int("MAX_CHUNKS", 12),
+        database_url=_get_str("DATABASE_URL", "sqlite:///./documents.db"),
     )
 
 

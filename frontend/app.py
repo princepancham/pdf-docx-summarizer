@@ -63,9 +63,14 @@ def main() -> None:
             st.caption(details)
             if result.get("truncated"):
                 st.warning("Long document was truncated to the first sections.")
+            st.rerun()
         else:
             assert isinstance(result, str)
             st.error(result)
+
+    st.divider()
+    st.subheader("History")
+    render_history()
 
 
 def summarize_document(
@@ -94,6 +99,80 @@ def summarize_document(
         return True, data
     detail = data.get("detail") if isinstance(data, dict) else None
     return False, str(detail or f"Backend returned status {response.status_code}.")
+
+
+def fetch_history(limit: int = 50) -> tuple[bool, dict | str]:
+    """GET the document history list. Returns (ok, data|error)."""
+    try:
+        response = requests.get(
+            f"{BACKEND_URL}/api/documents", params={"limit": limit}, timeout=30
+        )
+    except requests.RequestException:
+        return False, f"Cannot reach backend at {BACKEND_URL}. Is FastAPI running?"
+    try:
+        data = response.json()
+    except ValueError:
+        return False, f"Backend returned status {response.status_code}."
+    if response.status_code == 200:
+        return True, data
+    detail = data.get("detail") if isinstance(data, dict) else None
+    return False, str(detail or f"Backend returned status {response.status_code}.")
+
+
+def fetch_document(doc_id: int) -> tuple[bool, dict | str]:
+    """GET a single document record. Returns (ok, data|error)."""
+    try:
+        response = requests.get(
+            f"{BACKEND_URL}/api/documents/{doc_id}", timeout=30
+        )
+    except requests.RequestException:
+        return False, f"Cannot reach backend at {BACKEND_URL}. Is FastAPI running?"
+    try:
+        data = response.json()
+    except ValueError:
+        return False, f"Backend returned status {response.status_code}."
+    if response.status_code == 200:
+        return True, data
+    detail = data.get("detail") if isinstance(data, dict) else None
+    return False, str(detail or f"Backend returned status {response.status_code}.")
+
+
+def render_history() -> None:
+    """Render the document history list with a detail viewer."""
+    ok, result = fetch_history()
+    if not ok:
+        assert isinstance(result, str)
+        st.error(result)
+        return
+    assert isinstance(result, dict)
+    documents = result.get("documents", [])
+    if not documents:
+        st.info("No documents yet. Summarize a file above to build history.")
+        return
+    for doc in documents:
+        label = f"#{doc.get('id')} {doc.get('original_filename')} ({doc.get('status')})"
+        if st.button(label, key=f"doc-{doc.get('id')}"):
+            st.session_state.selected_id = doc.get("id")
+    selected = st.session_state.get("selected_id")
+    if selected is not None:
+        ok, result = fetch_document(selected)
+        if not ok:
+            assert isinstance(result, str)
+            st.error(result)
+            return
+        assert isinstance(result, dict)
+        st.subheader(f"Summary for {result.get('original_filename')}")
+        if result.get("status") == "failed":
+            st.error(result.get("error") or "Processing failed.")
+        else:
+            st.write(result.get("summary", ""))
+        st.caption(
+            f"Chunks: {result.get('chunks')} | "
+            f"Chars: {result.get('chars')} | "
+            f"Model: {result.get('model')}"
+        )
+        if result.get("truncated"):
+            st.warning("Long document was truncated to the first sections.")
 
 
 if __name__ == "__main__":

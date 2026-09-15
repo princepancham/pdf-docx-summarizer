@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 import backend.llm as llm_module
 import backend.main as main_module
 from backend.config import settings as prod_settings
+from backend.database import Base, get_db
 from backend.llm import LLMError
 from backend.main import app
 from tests.pdf_fixture import minimal_pdf_bytes
@@ -51,8 +52,31 @@ def _isolated_settings(
 
 @pytest.fixture()
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from backend import models  # noqa: F401  (register tables)
+
     _isolated_settings(monkeypatch, tmp_path)
-    return TestClient(app)
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'test.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    TestingSession = sessionmaker(
+        bind=engine, autoflush=False, autocommit=False
+    )
+    Base.metadata.create_all(bind=engine)
+
+    def override_get_db():
+        session = TestingSession()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+    yield TestClient(app)
+    app.dependency_overrides.clear()
 
 
 def test_summarize_short_docx(
@@ -79,6 +103,10 @@ def test_summarize_short_docx(
     assert data["model"] == main_module.settings.openrouter_model
     assert len(calls) == 1
     assert (tmp_path / data["stored_filename"]).is_file()
+    assert isinstance(data["id"], int)
+    detail = client.get(f"/api/documents/{data['id']}")
+    assert detail.status_code == 200
+    assert detail.json()["status"] == "completed"
 
 
 def test_summarize_short_pdf(
@@ -175,6 +203,15 @@ def test_summarize_invalid_extension_400(client: TestClient) -> None:
     assert response.status_code == 400
 
 
+def _stored_docs(tmp_path: Path) -> list[Path]:
+    """Stored upload files, excluding the isolated test database."""
+    return [
+        p
+        for p in tmp_path.iterdir()
+        if p.is_file() and p.suffix in {".pdf", ".docx"}
+    ]
+
+
 def test_summarize_blank_pdf_returns_422(
     client: TestClient, tmp_path: Path
 ) -> None:
@@ -189,7 +226,7 @@ def test_summarize_blank_pdf_returns_422(
         files={"file": ("blank.pdf", buf.getvalue(), PDF_MIME)},
     )
     assert response.status_code == 422
-    assert list(tmp_path.iterdir()) == []
+    assert _stored_docs(tmp_path) == []
 
 
 def test_summarize_corrupt_pdf_leaves_no_orphan(
@@ -200,4 +237,4 @@ def test_summarize_corrupt_pdf_leaves_no_orphan(
         files={"file": ("broken.pdf", b"%PDF-1.4 not really a pdf", PDF_MIME)},
     )
     assert response.status_code == 422
-    assert list(tmp_path.iterdir()) == []
+    assert _stored_docs(tmp_path) == []

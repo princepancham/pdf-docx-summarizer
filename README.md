@@ -1,22 +1,29 @@
 # PDF & DOCX Summarizer
 
-AI-powered web app to upload PDF/DOCX documents and generate summaries.
-Phase 1 foundation: FastAPI backend + Streamlit frontend + env configuration.
+AI-powered web app to upload PDF/DOCX documents and generate summaries,
+with persistent history stored in SQLite.
 
-## Phase 1 scope
+## Current functionality (Phases 1–3)
 
-- FastAPI with `GET /` and `GET /api/health`
-- Streamlit starter with backend connectivity check
+- FastAPI with `GET /`, `GET /api/health`
+- Secure upload: `POST /api/documents/upload` (PDF/DOCX, UUID filenames)
+- AI summarization: `POST /api/documents/summarize` (extract → clean →
+  chunk → OpenRouter), persisted to SQLite with success/failed status
+- History API: `GET /api/documents` (newest first, `limit`/`offset`
+  pagination) and `GET /api/documents/{id}` (full record + summary)
+- Streamlit UI: backend check, file upload + summary display, history
+  list with previous-summary viewer
 - Env-based config (`backend/config.py`, `.env.example`)
-- No upload, parsing, summarization, or database yet (Phases 2+)
 
 ## Project structure
 
 ```text
-backend/        FastAPI app (main.py, config.py)
+backend/        FastAPI app (main.py, config.py, database.py, models.py,
+                schemas.py, extract.py, textutil.py, llm.py)
 frontend/       Streamlit app (app.py, requests -> FastAPI only)
-tests/          Automated tests (from Phase 9)
+tests/          Automated tests (pytest)
 uploads/        Runtime upload dir (ignored by Git)
+documents.db    SQLite history database (ignored by Git)
 .env            Local secrets (ignored by Git, never commit)
 .env.example    Safe template for required env vars
 ```
@@ -33,9 +40,9 @@ python -m pip install -r requirements.txt
 
 # 3. Configure environment
 Copy-Item .env.example .env
-# OPENROUTER_API_KEY may stay empty in Phase 1 (needed from Phase 4)
+# OPENROUTER_API_KEY is required for summarization (leave empty to run
+# the app without AI; the summarize endpoint then returns 503)
 ```
-
 ## Run
 
 ```powershell
@@ -50,6 +57,9 @@ python -m streamlit run frontend/app.py
 
 - Backend root: `GET http://127.0.0.1:8000/` -> `{"message": ..., "docs": "/docs"}`
 - Health: `GET http://127.0.0.1:8000/api/health` -> `{"status": "ok", ...}`
+- Upload: `POST /api/documents/upload` with a PDF/DOCX file -> `201`
+- Summarize: `POST /api/documents/summarize` -> `200` with summary + `id`
+- History: `GET http://127.0.0.1:8000/api/documents` -> newest-first list
 - Streamlit shows "Connected" when backend is running, else a clear error.
 
 ## Security notes

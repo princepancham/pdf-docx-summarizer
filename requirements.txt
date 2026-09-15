@@ -11,3 +11,4 @@ pytest
 httpx
 pypdf
 python-docx
+sqlalchemy

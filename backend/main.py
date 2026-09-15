@@ -1,25 +1,39 @@
-"""FastAPI entrypoint — document upload + AI summarization.
+"""FastAPI entrypoint — document upload + AI summarization + history.
 
 Exposes a root endpoint, a health check, PDF/DOCX file upload,
-and single-call document summarization via OpenRouter.
-No database logic yet (deferred to later phases).
+single-call document summarization via OpenRouter, and SQLite-backed
+document history. No agent logic yet (deferred to later phases).
 """
 
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
 from backend.config import settings
+from backend.database import get_db, init_db
 from backend.extract import ExtractionError, extract_text
 from backend.llm import LLMError, summarize_chunks, summarize_text
+from backend.models import Document
+from backend.schemas import DocumentListOut, DocumentOut
 from backend.textutil import clean_text, split_chunks
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    init_db()
+    yield
+
 
 app = FastAPI(
     title=settings.app_name,
     description="AI-powered PDF & DOCX summarization API.",
-    version="0.3.0",
+    version="0.4.0",
+    lifespan=lifespan,
 )
 
 ALLOWED_EXTENSIONS = {".pdf", ".docx"}
@@ -38,6 +52,7 @@ class UploadResponse(BaseModel):
 
 
 class SummarizeResponse(BaseModel):
+    id: int
     filename: str
     stored_filename: str
     summary: str
@@ -190,14 +205,38 @@ async def upload_document(file: UploadFile = File(...)) -> UploadResponse:
 
 
 @app.post("/api/documents/summarize", response_model=SummarizeResponse)
-async def summarize_document(file: UploadFile = File(...)) -> SummarizeResponse:
+async def summarize_document(
+    file: UploadFile = File(...), db: Session = Depends(get_db)
+) -> SummarizeResponse:
     """Upload a document and return an OpenRouter-generated summary.
 
     Flow: validate -> save -> extract -> clean -> chunk if needed -> LLM.
+    Successful and failed runs are recorded in the history database.
     """
-    original_filename, _, _, stored_filename, dest, _ = (
+    original_filename, ext, content_type, stored_filename, dest, total = (
         await _store_validated_upload(file)
     )
+
+    def _record_failure(
+        *, chars: int, detail: str, model: str | None = None
+    ) -> None:
+        db.add(
+            Document(
+                original_filename=original_filename,
+                stored_filename=stored_filename,
+                file_type=ext,
+                content_type=content_type,
+                size_bytes=total,
+                status="failed",
+                summary=None,
+                chunks=0,
+                chars=chars,
+                truncated=False,
+                model=model if model is not None else settings.openrouter_model,
+                error=detail,
+            )
+        )
+        db.commit()
 
     try:
         raw_text = extract_text(dest)
@@ -217,9 +256,9 @@ async def summarize_document(file: UploadFile = File(...)) -> SummarizeResponse:
         )
 
     if not (settings.openrouter_api_key or "").strip():
-        raise HTTPException(
-            status_code=503, detail="AI service is not configured."
-        )
+        detail = "AI service is not configured."
+        _record_failure(chars=len(cleaned), detail=detail)
+        raise HTTPException(status_code=503, detail=detail)
 
     chars = len(cleaned)
     try:
@@ -233,9 +272,29 @@ async def summarize_document(file: UploadFile = File(...)) -> SummarizeResponse:
             summary, truncated = summarize_chunks(all_chunks)
             num_chunks = min(len(all_chunks), settings.max_chunks)
     except LLMError as exc:
+        _record_failure(chars=chars, detail=exc.message)
         raise HTTPException(status_code=exc.status_code, detail=exc.message)
 
+    record = Document(
+        original_filename=original_filename,
+        stored_filename=stored_filename,
+        file_type=ext,
+        content_type=content_type,
+        size_bytes=total,
+        status="completed",
+        summary=summary,
+        chunks=num_chunks,
+        chars=chars,
+        truncated=truncated,
+        model=settings.openrouter_model,
+        error=None,
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+
     return SummarizeResponse(
+        id=record.id,
         filename=original_filename,
         stored_filename=stored_filename,
         summary=summary,
@@ -244,6 +303,33 @@ async def summarize_document(file: UploadFile = File(...)) -> SummarizeResponse:
         truncated=truncated,
         model=settings.openrouter_model,
     )
+
+
+@app.get("/api/documents", response_model=DocumentListOut)
+def list_documents(
+    limit: int = 50, offset: int = 0, db: Session = Depends(get_db)
+) -> DocumentListOut:
+    """List document history, newest first, with offset pagination."""
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    total = db.query(Document).count()
+    rows = (
+        db.query(Document)
+        .order_by(Document.created_at.desc(), Document.id.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    return DocumentListOut(documents=rows, total=total)
+
+
+@app.get("/api/documents/{doc_id}", response_model=DocumentOut)
+def get_document(doc_id: int, db: Session = Depends(get_db)) -> DocumentOut:
+    """Return a single document record with its summary."""
+    record = db.query(Document).filter(Document.id == doc_id).first()
+    if record is None:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    return record
 
 
 if __name__ == "__main__":
