@@ -1,6 +1,6 @@
 """SQLAlchemy ORM models (single Document table, no raw SQL)."""
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text, func
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.database import Base
@@ -24,6 +24,10 @@ class Document(Base):
     truncated: Mapped[bool] = mapped_column(Boolean, default=False)
     model: Mapped[str | None] = mapped_column(String(128), nullable=True)
     error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    strategy: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    quality_score: Mapped[float] = mapped_column(Float, default=0.0)
+    key_points: Mapped[str | None] = mapped_column(Text, nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[object] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), index=True
     )

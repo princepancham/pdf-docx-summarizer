@@ -1,30 +1,37 @@
-"""FastAPI entrypoint — document upload + AI summarization + history.
+"""FastAPI entrypoint — upload + agentic AI summarization + history.
 
 Exposes a root endpoint, a health check, PDF/DOCX file upload,
-single-call document summarization via OpenRouter, and SQLite-backed
-document history. No agent logic yet (deferred to later phases).
+agent-driven document summarization via OpenRouter, and SQLite-backed
+document history. No multi-agent logic (single bounded-loop agent only).
 """
 
+import json
+import logging
+import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from backend.config import settings
+from backend import agent
+from backend.config import settings, validate_settings
 from backend.database import get_db, init_db
 from backend.extract import ExtractionError, extract_text
-from backend.llm import LLMError, summarize_chunks, summarize_text
+from backend.llm import LLMError
 from backend.models import Document
 from backend.schemas import DocumentListOut, DocumentOut
-from backend.textutil import clean_text, split_chunks
+from backend.textutil import clean_text
+
+logger = logging.getLogger("pdf_summarizer")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    validate_settings()
     init_db()
     yield
 
@@ -32,9 +39,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(
     title=settings.app_name,
     description="AI-powered PDF & DOCX summarization API.",
-    version="0.4.0",
+    version="0.5.0",
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    """Attach a short request ID to every response for traceability."""
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = uuid.uuid4().hex[:8]
+    return response
 
 ALLOWED_EXTENSIONS = {".pdf", ".docx"}
 ALLOWED_MIME_TYPES = {
@@ -60,6 +75,10 @@ class SummarizeResponse(BaseModel):
     chars: int
     truncated: bool
     model: str
+    strategy: str
+    key_points: list[str] = []
+    quality_score: float = 0.0
+    notes: list[str] = []
 
 
 @app.get("/")
@@ -208,17 +227,18 @@ async def upload_document(file: UploadFile = File(...)) -> UploadResponse:
 async def summarize_document(
     file: UploadFile = File(...), db: Session = Depends(get_db)
 ) -> SummarizeResponse:
-    """Upload a document and return an OpenRouter-generated summary.
+    """Upload a document and return an agent-produced summary.
 
-    Flow: validate -> save -> extract -> clean -> chunk if needed -> LLM.
+    Flow: validate -> save -> extract -> clean -> agent -> persist.
     Successful and failed runs are recorded in the history database.
     """
+    started = time.perf_counter()
     original_filename, ext, content_type, stored_filename, dest, total = (
         await _store_validated_upload(file)
     )
 
     def _record_failure(
-        *, chars: int, detail: str, model: str | None = None
+        *, chars: int, detail: str, strategy: str = "unknown"
     ) -> None:
         db.add(
             Document(
@@ -232,11 +252,21 @@ async def summarize_document(
                 chunks=0,
                 chars=chars,
                 truncated=False,
-                model=model if model is not None else settings.openrouter_model,
+                model=settings.openrouter_model,
                 error=detail,
+                strategy=strategy,
+                quality_score=0.0,
+                key_points=None,
+                notes=None,
             )
         )
         db.commit()
+        logger.warning(
+            "summarize failed file=%s strategy=%s detail=%s",
+            stored_filename,
+            strategy,
+            detail,
+        )
 
     try:
         raw_text = extract_text(dest)
@@ -260,19 +290,11 @@ async def summarize_document(
         _record_failure(chars=len(cleaned), detail=detail)
         raise HTTPException(status_code=503, detail=detail)
 
-    chars = len(cleaned)
     try:
-        if chars <= settings.chunk_chars:
-            summary = summarize_text(cleaned)
-            num_chunks, truncated = 1, False
-        else:
-            all_chunks = split_chunks(
-                cleaned, settings.chunk_chars, settings.chunk_overlap
-            )
-            summary, truncated = summarize_chunks(all_chunks)
-            num_chunks = min(len(all_chunks), settings.max_chunks)
+        result = agent.run(cleaned)
     except LLMError as exc:
-        _record_failure(chars=chars, detail=exc.message)
+        strategy = getattr(exc, "strategy", None) or "unknown"
+        _record_failure(chars=len(cleaned), detail=exc.message, strategy=strategy)
         raise HTTPException(status_code=exc.status_code, detail=exc.message)
 
     record = Document(
@@ -282,40 +304,103 @@ async def summarize_document(
         content_type=content_type,
         size_bytes=total,
         status="completed",
-        summary=summary,
-        chunks=num_chunks,
-        chars=chars,
-        truncated=truncated,
+        summary=result.summary,
+        chunks=result.chunks,
+        chars=len(cleaned),
+        truncated=result.truncated,
         model=settings.openrouter_model,
         error=None,
+        strategy=result.strategy,
+        quality_score=result.quality_score,
+        key_points=json.dumps(result.key_points),
+        notes="\n".join(result.notes) if result.notes else None,
     )
     db.add(record)
     db.commit()
     db.refresh(record)
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    logger.info(
+        "summarized id=%s strategy=%s chunks=%s score=%.2f ms=%s",
+        record.id,
+        result.strategy,
+        result.chunks,
+        result.quality_score,
+        elapsed_ms,
+    )
 
     return SummarizeResponse(
         id=record.id,
         filename=original_filename,
         stored_filename=stored_filename,
-        summary=summary,
-        chunks=num_chunks,
-        chars=chars,
-        truncated=truncated,
+        summary=result.summary,
+        chunks=result.chunks,
+        chars=len(cleaned),
+        truncated=result.truncated,
         model=settings.openrouter_model,
+        strategy=result.strategy,
+        key_points=result.key_points,
+        quality_score=result.quality_score,
+        notes=result.notes,
+    )
+
+
+def _to_document_out(record: Document) -> DocumentOut:
+    """Convert a row to its schema, decoding stored JSON/lines fields."""
+    try:
+        key_points = json.loads(record.key_points) if record.key_points else []
+    except ValueError:
+        key_points = []
+    if not isinstance(key_points, list):
+        key_points = []
+    notes = record.notes.split("\n") if record.notes else []
+    return DocumentOut(
+        id=record.id,
+        original_filename=record.original_filename,
+        stored_filename=record.stored_filename,
+        file_type=record.file_type,
+        content_type=record.content_type,
+        size_bytes=record.size_bytes,
+        status=record.status,
+        summary=record.summary,
+        chunks=record.chunks,
+        chars=record.chars,
+        truncated=record.truncated,
+        model=record.model,
+        error=record.error,
+        strategy=record.strategy,
+        quality_score=record.quality_score or 0.0,
+        key_points=[str(p) for p in key_points],
+        notes=[n for n in notes if n],
+        created_at=record.created_at,
     )
 
 
 @app.get("/api/documents", response_model=DocumentListOut)
 def list_documents(
-    limit: int = 50, offset: int = 0, db: Session = Depends(get_db)
+    limit: int = 50,
+    offset: int = 0,
+    status: str | None = None,
+    q: str | None = None,
+    db: Session = Depends(get_db),
 ) -> DocumentListOut:
     """List document history, newest first, with offset pagination."""
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
-    total = db.query(Document).count()
+    query = db.query(Document)
+    if status is not None:
+        if status not in ("completed", "failed"):
+            raise HTTPException(
+                status_code=422,
+                detail="Invalid status filter. Use completed or failed.",
+            )
+        query = query.filter(Document.status == status)
+    if q is not None and q.strip():
+        query = query.filter(
+            Document.original_filename.ilike(f"%{q.strip()}%")
+        )
+    total = query.count()
     rows = (
-        db.query(Document)
-        .order_by(Document.created_at.desc(), Document.id.desc())
+        query.order_by(Document.created_at.desc(), Document.id.desc())
         .offset(offset)
         .limit(limit)
         .all()
@@ -329,7 +414,7 @@ def get_document(doc_id: int, db: Session = Depends(get_db)) -> DocumentOut:
     record = db.query(Document).filter(Document.id == doc_id).first()
     if record is None:
         raise HTTPException(status_code=404, detail="Document not found.")
-    return record
+    return _to_document_out(record)
 
 
 if __name__ == "__main__":

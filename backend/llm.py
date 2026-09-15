@@ -1,9 +1,11 @@
-"""OpenRouter summarization via the OpenAI-compatible Chat Completions API.
+"""OpenRouter calls via the OpenAI-compatible Chat Completions API.
 
-All calls go through _chat() so tests can patch a single seam and
-no test ever hits the network. The API key is read from settings
+All network traffic goes through _chat(), so tests patch a single seam
+and never hit the network. The API key is read from settings
 at call time and is never logged.
 """
+
+import json
 
 import httpx
 
@@ -20,6 +22,15 @@ COMBINE_PROMPT_TEMPLATE = (
     "document summary:\n\n{partials}"
 )
 TRUNCATION_NOTE = "\n\n(Note: long document truncated to the first {n} sections.)"
+BULLETS_PROMPT_TEMPLATE = (
+    "List the key points of this document section (part {i} of {n}) "
+    "as short bullet lines, one per line:\n\n{chunk}"
+)
+PLAN_SYSTEM_PROMPT = (
+    "You are a summarization planner. Reply with a single JSON object only, "
+    ' shaped like {"strategy": "direct|map_reduce|key_points_first", '
+    '"focus": "<one short phrase or empty>", "max_sections": <int>}.'
+)
 
 
 class LLMError(Exception):
@@ -33,6 +44,17 @@ class LLMError(Exception):
 
 def _chat(messages: list[dict[str, str]]) -> str:
     """Send chat messages to OpenRouter and return the reply text."""
+    return _chat_raw(
+        messages,
+        max_tokens=settings.openrouter_max_tokens,
+        temperature=0.2,
+    )
+
+
+def _chat_raw(
+    messages: list[dict[str, str]], *, max_tokens: int, temperature: float
+) -> str:
+    """Shared Chat Completions call with explicit sampling parameters."""
     api_key = (settings.openrouter_api_key or "").strip()
     if not api_key:
         raise LLMError("AI service is not configured.", 503)
@@ -48,8 +70,8 @@ def _chat(messages: list[dict[str, str]]) -> str:
             },
             json={
                 "model": settings.openrouter_model,
-                "temperature": 0.2,
-                "max_tokens": settings.openrouter_max_tokens,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
                 "messages": messages,
             },
             timeout=settings.openrouter_timeout_s,
@@ -122,3 +144,41 @@ def summarize_chunks(chunks: list[str]) -> tuple[str, bool]:
     if truncated:
         combined += TRUNCATION_NOTE.format(n=settings.max_chunks)
     return combined, truncated
+
+
+def summarize_bullets(chunk: str, i: int, n: int) -> str:
+    """Extract the key points of one section as bullet lines."""
+    return _chat(
+        [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": BULLETS_PROMPT_TEMPLATE.format(i=i, n=n, chunk=chunk),
+            },
+        ]
+    )
+
+
+def chat_json(system: str, user: str) -> dict:
+    """Chat call that must reply with a JSON object (for the planner)."""
+    raw = _chat_raw(
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        max_tokens=settings.agent_plan_tokens,
+        temperature=0.0,
+    )
+    try:
+        return json.loads(raw)
+    except ValueError:
+        pass
+    start, end = raw.find("{"), raw.rfind("}")
+    if start != -1 and end > start:
+        try:
+            parsed = json.loads(raw[start : end + 1])
+            if isinstance(parsed, dict):
+                return parsed
+        except ValueError:
+            pass
+    raise LLMError("AI service returned an invalid response.", 502)

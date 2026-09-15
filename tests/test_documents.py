@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+import backend.agent as agent_module
 import backend.database as db_module
 import backend.llm as llm_module
 import backend.main as main_module
@@ -49,6 +50,12 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     )
     monkeypatch.setattr(main_module, "settings", isolated)
     monkeypatch.setattr(llm_module, "settings", isolated)
+    monkeypatch.setattr(agent_module, "settings", isolated)
+
+    def _plan_unavailable(system: str, user: str) -> dict:
+        raise LLMError("AI service returned an invalid response.", 502)
+
+    monkeypatch.setattr(llm_module, "chat_json", _plan_unavailable)
 
     engine = create_engine(
         f"sqlite:///{tmp_path / 'test.db'}",
@@ -132,6 +139,7 @@ def test_missing_key_persisted_as_failed(
     )
     monkeypatch.setattr(main_module, "settings", isolated)
     monkeypatch.setattr(llm_module, "settings", isolated)
+    monkeypatch.setattr(agent_module, "settings", isolated)
     response = _summarize(client, "nokey.docx")
     assert response.status_code == 503
     docs = client.get("/api/documents").json()["documents"]
@@ -195,3 +203,63 @@ def test_real_database_file_untouched() -> None:
 def test_db_module_import_does_not_create_file() -> None:
     assert db_module.engine is not None
     assert not (BASE_DIR / "documents.db").exists()
+
+
+def test_history_status_filter(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(llm_module, "_chat", lambda messages: "S")
+    assert _summarize(client, "good.docx").status_code == 200
+
+    def boom(messages):
+        raise LLMError("AI service timed out.", 504)
+
+    monkeypatch.setattr(llm_module, "_chat", boom)
+    assert _summarize(client, "bad.docx").status_code == 504
+
+    completed = client.get("/api/documents", params={"status": "completed"})
+    assert completed.status_code == 200
+    assert [d["original_filename"] for d in completed.json()["documents"]] == [
+        "good.docx"
+    ]
+    failed = client.get("/api/documents", params={"status": "failed"})
+    assert [d["original_filename"] for d in failed.json()["documents"]] == [
+        "bad.docx"
+    ]
+    bogus = client.get("/api/documents", params={"status": "bogus"})
+    assert bogus.status_code == 422
+
+
+def test_history_q_search(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(llm_module, "_chat", lambda messages: "S")
+    assert _summarize(client, "quarterly-report.docx").status_code == 200
+    assert _summarize(client, "meeting-notes.docx").status_code == 200
+
+    response = client.get("/api/documents", params={"q": "quarter"})
+    assert response.status_code == 200
+    docs = response.json()["documents"]
+    assert [d["original_filename"] for d in docs] == ["quarterly-report.docx"]
+
+    response = client.get("/api/documents", params={"q": "QUARTER"})
+    assert len(response.json()["documents"]) == 1
+
+    response = client.get("/api/documents", params={"q": "nothing-here"})
+    assert response.json() == {"documents": [], "total": 0}
+
+
+def test_responses_carry_request_id(client: TestClient) -> None:
+    assert "x-request-id" in {k.lower() for k in client.get("/").headers}
+    assert "x-request-id" in {
+        k.lower() for k in client.get("/api/documents").headers
+    }
+
+
+def test_history_lists_strategy(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(llm_module, "_chat", lambda messages: "S")
+    assert _summarize(client, "strat.docx").status_code == 200
+    docs = client.get("/api/documents").json()["documents"]
+    assert docs[0]["strategy"] == "direct"

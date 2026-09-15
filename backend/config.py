@@ -26,6 +26,13 @@ def _get_int(key: str, default: int) -> int:
         return default
 
 
+def _get_float(key: str, default: float) -> float:
+    try:
+        return float(os.getenv(key, str(default)))
+    except ValueError:
+        return default
+
+
 def _get_bool(key: str, default: bool) -> bool:
     value = os.getenv(key)
     if value is None:
@@ -51,6 +58,9 @@ class Settings:
     chunk_overlap: int
     max_chunks: int
     database_url: str
+    agent_max_repairs: int
+    agent_plan_tokens: int
+    agent_min_coverage: float
 
 
 def get_settings() -> Settings:
@@ -82,7 +92,34 @@ def get_settings() -> Settings:
         chunk_overlap=_get_int("CHUNK_OVERLAP", 200),
         max_chunks=_get_int("MAX_CHUNKS", 12),
         database_url=_get_str("DATABASE_URL", "sqlite:///./documents.db"),
+        agent_max_repairs=_get_int("AGENT_MAX_REPAIRS", 1),
+        agent_plan_tokens=_get_int("AGENT_PLAN_TOKENS", 150),
+        agent_min_coverage=_get_float("AGENT_MIN_COVERAGE", 0.3),
     )
+
+
+def validate_settings(s: Settings | None = None) -> None:
+    """Fail fast on nonsensical configuration (called at startup)."""
+    s = s if s is not None else settings
+    problems = []
+    if s.chunk_chars <= 0:
+        problems.append("CHUNK_CHARS must be > 0")
+    if not 0 <= s.chunk_overlap < s.chunk_chars:
+        problems.append("CHUNK_OVERLAP must satisfy 0 <= overlap < CHUNK_CHARS")
+    if s.max_chunks < 1:
+        problems.append("MAX_CHUNKS must be >= 1")
+    if s.openrouter_timeout_s <= 0:
+        problems.append("OPENROUTER_TIMEOUT_S must be > 0")
+    if s.openrouter_max_tokens <= 0:
+        problems.append("OPENROUTER_MAX_TOKENS must be > 0")
+    if s.agent_plan_tokens <= 0:
+        problems.append("AGENT_PLAN_TOKENS must be > 0")
+    if not 0 < s.agent_min_coverage <= 1:
+        problems.append("AGENT_MIN_COVERAGE must satisfy 0 < coverage <= 1")
+    if s.agent_max_repairs < 0:
+        problems.append("AGENT_MAX_REPAIRS must be >= 0")
+    if problems:
+        raise RuntimeError("Invalid configuration: " + "; ".join(problems))
 
 
 settings = get_settings()

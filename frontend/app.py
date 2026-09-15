@@ -54,15 +54,7 @@ def main() -> None:
             )
         if ok:
             assert isinstance(result, dict)
-            st.write(result.get("summary", ""))
-            details = (
-                f"Chunks: {result.get('chunks')} | "
-                f"Chars: {result.get('chars')} | "
-                f"Model: {result.get('model')}"
-            )
-            st.caption(details)
-            if result.get("truncated"):
-                st.warning("Long document was truncated to the first sections.")
+            render_summary(result)
             st.rerun()
         else:
             assert isinstance(result, str)
@@ -71,6 +63,29 @@ def main() -> None:
     st.divider()
     st.subheader("History")
     render_history()
+
+
+def render_summary(result: dict) -> None:
+    """Render an agent-produced summary with strategy and quality info."""
+    st.write(result.get("summary", ""))
+    key_points = result.get("key_points") or []
+    if key_points:
+        st.subheader("Key points")
+        for point in key_points:
+            st.markdown(f"- {point}")
+    details = (
+        f"Strategy: {result.get('strategy', 'direct')} | "
+        f"Quality score: {result.get('quality_score', 0.0):.2f} | "
+        f"Chunks: {result.get('chunks')} | "
+        f"Chars: {result.get('chars')} | "
+        f"Model: {result.get('model')}"
+    )
+    st.caption(details)
+    if result.get("truncated"):
+        st.warning("Long document was truncated to the first sections.")
+    notes = result.get("notes") or []
+    if notes:
+        st.warning("Agent notes: " + "; ".join(str(n) for n in notes))
 
 
 def summarize_document(
@@ -101,11 +116,18 @@ def summarize_document(
     return False, str(detail or f"Backend returned status {response.status_code}.")
 
 
-def fetch_history(limit: int = 50) -> tuple[bool, dict | str]:
+def fetch_history(
+    limit: int = 50, status: str | None = None, q: str | None = None
+) -> tuple[bool, dict | str]:
     """GET the document history list. Returns (ok, data|error)."""
+    params: dict[str, str] = {"limit": str(limit)}
+    if status:
+        params["status"] = status
+    if q:
+        params["q"] = q
     try:
         response = requests.get(
-            f"{BACKEND_URL}/api/documents", params={"limit": limit}, timeout=30
+            f"{BACKEND_URL}/api/documents", params=params, timeout=30
         )
     except requests.RequestException:
         return False, f"Cannot reach backend at {BACKEND_URL}. Is FastAPI running?"
@@ -138,8 +160,11 @@ def fetch_document(doc_id: int) -> tuple[bool, dict | str]:
 
 
 def render_history() -> None:
-    """Render the document history list with a detail viewer."""
-    ok, result = fetch_history()
+    """Render the document history list with search, filter, and detail."""
+    query = st.text_input("Search by filename", value="")
+    status_filter = st.selectbox("Status", ["all", "completed", "failed"])
+    status = None if status_filter == "all" else status_filter
+    ok, result = fetch_history(status=status, q=query or None)
     if not ok:
         assert isinstance(result, str)
         st.error(result)
@@ -150,7 +175,10 @@ def render_history() -> None:
         st.info("No documents yet. Summarize a file above to build history.")
         return
     for doc in documents:
-        label = f"#{doc.get('id')} {doc.get('original_filename')} ({doc.get('status')})"
+        label = (
+            f"#{doc.get('id')} {doc.get('original_filename')} "
+            f"({doc.get('status')} · {doc.get('strategy', 'direct')})"
+        )
         if st.button(label, key=f"doc-{doc.get('id')}"):
             st.session_state.selected_id = doc.get("id")
     selected = st.session_state.get("selected_id")
@@ -165,14 +193,7 @@ def render_history() -> None:
         if result.get("status") == "failed":
             st.error(result.get("error") or "Processing failed.")
         else:
-            st.write(result.get("summary", ""))
-        st.caption(
-            f"Chunks: {result.get('chunks')} | "
-            f"Chars: {result.get('chars')} | "
-            f"Model: {result.get('model')}"
-        )
-        if result.get("truncated"):
-            st.warning("Long document was truncated to the first sections.")
+            render_summary(result)
 
 
 if __name__ == "__main__":

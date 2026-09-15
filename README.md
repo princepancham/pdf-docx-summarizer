@@ -3,23 +3,43 @@
 AI-powered web app to upload PDF/DOCX documents and generate summaries,
 with persistent history stored in SQLite.
 
-## Current functionality (Phases 1–3)
+## Current functionality (Phases 1–4)
 
 - FastAPI with `GET /`, `GET /api/health`
 - Secure upload: `POST /api/documents/upload` (PDF/DOCX, UUID filenames)
-- AI summarization: `POST /api/documents/summarize` (extract → clean →
-  chunk → OpenRouter), persisted to SQLite with success/failed status
+- Agentic summarization: `POST /api/documents/summarize` — a bounded-loop
+  agent profiles each document, picks a strategy (`direct`, `map_reduce`,
+  `key_points_first`), executes it, then checks deterministic quality
+  gates (`quality_score`) with at most one repair retry. Returns summary,
+  key points, strategy, quality score, and agent notes.
 - History API: `GET /api/documents` (newest first, `limit`/`offset`
-  pagination) and `GET /api/documents/{id}` (full record + summary)
-- Streamlit UI: backend check, file upload + summary display, history
-  list with previous-summary viewer
+  pagination, `status` + `q` filters) and `GET /api/documents/{id}`
+  (full record + summary), persisted to SQLite with success/failed status
+- Streamlit UI: backend check, file upload + summary display (strategy,
+  key points, quality score), searchable/filterable history with
+  previous-summary viewer
 - Env-based config (`backend/config.py`, `.env.example`)
+
+## Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `OPENROUTER_API_KEY` | (empty) | Secret key for OpenRouter; empty disables AI (503) |
+| `OPENROUTER_MODEL` | `openrouter/free` | Chat model for summaries and planner |
+| `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | API base URL |
+| `OPENROUTER_TIMEOUT_S` | `45` | Per-request timeout (seconds) |
+| `OPENROUTER_MAX_TOKENS` | `500` | Max summary tokens |
+| `CHUNK_CHARS` / `CHUNK_OVERLAP` / `MAX_CHUNKS` | `4000` / `200` / `12` | Long-document chunking |
+| `AGENT_MAX_REPAIRS` | `1` | Bounded repair retries after failed quality gates |
+| `AGENT_PLAN_TOKENS` | `150` | Token budget for the planning call |
+| `AGENT_MIN_COVERAGE` | `0.3` | Required key-term coverage fraction |
+| `DATABASE_URL` | `sqlite:///./documents.db` | History database location |
 
 ## Project structure
 
 ```text
 backend/        FastAPI app (main.py, config.py, database.py, models.py,
-                schemas.py, extract.py, textutil.py, llm.py)
+                schemas.py, agent.py, extract.py, textutil.py, llm.py)
 frontend/       Streamlit app (app.py, requests -> FastAPI only)
 tests/          Automated tests (pytest)
 uploads/        Runtime upload dir (ignored by Git)

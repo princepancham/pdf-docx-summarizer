@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 import backend.llm as llm_module
 import backend.main as main_module
+import backend.agent as agent_module
 from backend.config import settings as prod_settings
 from backend.database import Base, get_db
 from backend.llm import LLMError
@@ -47,6 +48,12 @@ def _isolated_settings(
     isolated = dataclasses.replace(prod_settings, **values)
     monkeypatch.setattr(main_module, "settings", isolated)
     monkeypatch.setattr(llm_module, "settings", isolated)
+    monkeypatch.setattr(agent_module, "settings", isolated)
+
+    def _plan_unavailable(system: str, user: str) -> dict:
+        raise LLMError("AI service returned an invalid response.", 502)
+
+    monkeypatch.setattr(llm_module, "chat_json", _plan_unavailable)
     return isolated
 
 
@@ -101,7 +108,9 @@ def test_summarize_short_docx(
     assert data["truncated"] is False
     assert data["chars"] > 0
     assert data["model"] == main_module.settings.openrouter_model
-    assert len(calls) == 1
+    # Plan falls back (no chat) + execute + 1 bounded repair ("SHORT SUMMARY"
+    # fails the coverage gates, which is exactly what the repair loop is for).
+    assert len(calls) == 2
     assert (tmp_path / data["stored_filename"]).is_file()
     assert isinstance(data["id"], int)
     detail = client.get(f"/api/documents/{data['id']}")
@@ -129,7 +138,11 @@ def test_summarize_long_doc_uses_chunks(
     def fake_chat(messages):
         seen.append(messages[-1]["content"])
         if messages[-1]["content"].startswith("Combine"):
-            return "FINAL SUMMARY"
+            return "FINAL SUMMARY. " + (
+                "Lorem ipsum dolor amet content sentence. " * 12
+            )
+        if messages[-1]["content"].startswith("List the key points"):
+            return "- lorem point about content\n- ipsum point about text"
         return f"PART {len(seen)}"
 
     monkeypatch.setattr(llm_module, "_chat", fake_chat)
@@ -142,8 +155,8 @@ def test_summarize_long_doc_uses_chunks(
     data = response.json()
     assert data["chunks"] > 1
     assert data["truncated"] is False
-    assert data["summary"] == "FINAL SUMMARY"
-    # N chunk calls + 1 combine call.
+    assert data["summary"].startswith("FINAL SUMMARY")
+    # N chunk calls + 1 combine call (gates pass, no repair).
     assert len(seen) == data["chunks"] + 1
 
 
